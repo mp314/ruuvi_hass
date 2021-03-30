@@ -1,17 +1,19 @@
 import datetime
 import logging
+import time
 
 import voluptuous as vol
 
 from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import TEMP_CELSIUS
+from homeassistant.const import TEMP_CELSIUS, PERCENTAGE, PRESSURE_HPA
 from homeassistant.helpers.entity import Entity
 import homeassistant.helpers.config_validation as cv
 from homeassistant.const import (
-    CONF_FORCE_UPDATE, CONF_MONITORED_CONDITIONS, CONF_NAME, CONF_MAC
+    CONF_FORCE_UPDATE, CONF_MONITORED_CONDITIONS,
+    CONF_NAME, CONF_MAC, CONF_SENSORS
 )
 
-from ruuvitag_sensor.ruuvi import RuuviTagSensor
+from simple_ruuvitag.ruuvi import RuuviTagClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,73 +26,154 @@ CONF_POLL_INTERVAL = 'poll_interval'
 DEFAULT_ADAPTER = '' 
 DEFAULT_FORCE_UPDATE = False
 DEFAULT_NAME = 'RuuviTag'
-DEFAULT_TIMEOUT = 3
+DEFAULT_TIMEOUT = 5
 MAX_POLL_INTERVAL = 10  # in seconds
+
+MILI_G = "cm/s2"
+MILI_VOLT = "mV"
 
 # Sensor types are defined like: Name, units
 SENSOR_TYPES = {
     'temperature': ['Temperature', TEMP_CELSIUS],
-    'humidity': ['Humidity', '%'],
-    'pressure': ['Pressure', 'hPa'],
+    'humidity': ['Humidity', PERCENTAGE],
+    'pressure': ['Pressure', PRESSURE_HPA],
+    'acceleration': ['Acceleration', MILI_G],
+    'acceleration_x': ['X Acceleration', MILI_G],
+    'acceleration_y': ['Y Acceleration', MILI_G],
+    'acceleration_z': ['Z Acceleration', MILI_G],
+    'battery': ['Battery voltage', MILI_VOLT],
+    'movement_counter': ['Movement counter', 'count'],
 }
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_MAC): cv.string,
-    vol.Optional(CONF_MONITORED_CONDITIONS, default=list(SENSOR_TYPES)):
-        vol.All(cv.ensure_list, [vol.In(SENSOR_TYPES)]),
-    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-    vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-    vol.Optional(CONF_POLL_INTERVAL, default=MAX_POLL_INTERVAL): cv.positive_int,
-    vol.Optional(CONF_ADAPTER, default=DEFAULT_ADAPTER): cv.string,
-})
+PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+    {
+        vol.Required(CONF_SENSORS): vol.All(
+                cv.ensure_list,
+                [
+                    vol.Schema(
+                        {
+                            vol.Required(CONF_MAC): cv.string,
+                            vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+                            vol.Optional(
+                                CONF_MONITORED_CONDITIONS,
+                                default=list(SENSOR_TYPES)): vol.All(
+                                    cv.ensure_list,
+                                    [vol.In(SENSOR_TYPES)]),
+                        }
+                    )
+                ],
+        ),
+        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
+        vol.Optional(
+            CONF_POLL_INTERVAL,
+            default=MAX_POLL_INTERVAL): cv.positive_int,
+        vol.Optional(CONF_ADAPTER, default=DEFAULT_ADAPTER): cv.string,
+    }
+)
 
-
-def setup_platform(hass, config, add_devices, discovery_info=None):
-
-    mac_addresses = config.get(CONF_MAC)
+def setup_platform(hass, config, add_devices, discovery_info = None):
+    mac_addresses = [resource[CONF_MAC].upper() for resource in config[CONF_SENSORS]]
     if not isinstance(mac_addresses, list):
         mac_addresses = [mac_addresses]
 
     probe = RuuviProbe(
-            RuuviTagSensor, 
-            mac_addresses, 
-            config.get(CONF_TIMEOUT), 
-            config.get(CONF_POLL_INTERVAL), 
+            RuuviTagClient,
+            mac_addresses,
+            config.get(CONF_TIMEOUT),
+            config.get(CONF_POLL_INTERVAL),
             config.get(CONF_ADAPTER)
         )
 
     devs = []
-    for mac_address in mac_addresses:
-        for condition in config.get(CONF_MONITORED_CONDITIONS):
-            prefix = config.get(CONF_NAME, mac_address)
-            name = "{} {}".format(prefix, condition)
+
+    for resource in config[CONF_SENSORS]:
+        mac_address = resource[CONF_MAC].upper()
+        name = resource.get(CONF_NAME, mac_address)
+        for condition in resource[CONF_MONITORED_CONDITIONS]:
+            qualified_name = "{} {}".format(name, condition)
 
             devs.append(RuuviSensor(
-                probe, config.get(CONF_MAC), condition, name
+                probe, mac_address, condition, qualified_name
             ))
     add_devices(devs)
 
 
 class RuuviProbe(object):
-    def __init__(self, RuuviTagSensor, mac_addresses, timeout, max_poll_interval, adapter):
-        self.RuuviTagSensor = RuuviTagSensor
+    def __init__(self, RuuviTagClient, mac_addresses, timeout, max_poll_interval, adapter):
         self.mac_addresses = mac_addresses
         self.timeout = timeout
         self.max_poll_interval = max_poll_interval
         self.last_poll = datetime.datetime.now()
         self.adapter = adapter
 
-        default_condition = {'humidity': None, 'identifier': None, 'pressure': None, 'temperature': None}
-        self.conditions = {mac: default_condition for mac in mac_addresses}
+        self.ble_client = RuuviTagClient(
+            mac_addresses=mac_addresses,
+            bt_device=adapter)
+        self.already_pooling = False  # TODO: Turn me into a semaphore
+
+        self.default_condition = {
+            'humidity': None,
+            'identifier': None,
+            'pressure': None,
+            'temperature': None,
+            'acceleration': None,
+            'acceleration_x': None,
+            'acceleration_y': None,
+            'acceleration_z': None,
+            'battery': None,
+            'movement_counter': None,
+        }
+        self.conditions = {
+            mac: self.default_condition for mac in self.mac_addresses
+            }
 
     def poll(self):
-        if (datetime.datetime.now() - self.last_poll).total_seconds() < self.max_poll_interval:
+
+        if self.already_pooling:
+            wait_timeout = False
+            start_wait_time = datetime.datetime.now()
+
+            while self.already_pooling and not wait_timeout:
+                time.sleep(1)
+                if (datetime.datetime.now() - start_wait_time).total_seconds() > self.timeout:
+                    wait_timeout = True
             return
+
+        if (datetime.datetime.now() - self.last_poll).total_seconds() < self.max_poll_interval:
+            # No need probe every time each HASS Sensor Sensor wants new data.
+            return
+
         try:
-            self.conditions = self.RuuviTagSensor.get_data_for_sensors(self.mac_addresses, self.timeout, self.adapter)
-        except:
-            _LOGGER.exception("Error on polling sensors")
-        self.last_poll = datetime.datetime.now()
+            self.already_pooling = True
+            self.ble_client.start()
+            start_pool_time = datetime.datetime.now()
+
+            # update flags
+            ready = False
+            timeout = False
+
+            while not ready and not timeout:
+                current_state = self.ble_client.get_current_datas()
+                if len(current_state) >= len(self.mac_addresses):
+                    ready = True
+                
+                if (datetime.datetime.now() - start_pool_time).total_seconds() > self.timeout:
+                    timeout = True
+                time.sleep(1)
+
+            # We either got data for all the sensors, or we timed outed. 
+            # Let's return what we have
+            self.conditions = {
+                mac: self.default_condition for mac in self.mac_addresses
+                }
+            self.conditions = self.ble_client.get_current_datas(consume=True)
+            self.last_poll = datetime.datetime.now()
+            self.ble_client.stop()
+            self.already_pooling = False
+        except Exception as e:
+            self.ble_client.stop()
+            self.already_pooling = False
+            _LOGGER.exception("Error on polling sensors %s" % e)
 
 
 class RuuviSensor(Entity):
@@ -116,5 +199,4 @@ class RuuviSensor(Entity):
 
     def update(self):
         self.poller.poll()
-
         self._state = self.poller.conditions.get(self.mac_address, {}).get(self.sensor_type)

@@ -1,9 +1,9 @@
 
 {
     "domain": "ruuvi",
-    "name": "Ruuvi tag Sensor",
+    "name": "Ruuvi tag Sensor for HASS.IO",
     "documentation": "https://github.com/JonasR-/ruuvi_hass",
     "dependencies": [],
     "codeowners": ["@JonasR", "@salleq", "@PieterGit", "@smaisidoro"],
-    "requirements": ["ruuvitag_sensor"]
+    "requirements": ["simple-ruuvitag==0.0.5"]
   }
